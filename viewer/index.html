@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NeuralRecon Viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: system-ui, sans-serif; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #hud { position: fixed; top: 12px; left: 12px; color: #ddd; font-size: 13px; line-height: 1.5;
+         background: rgba(0,0,0,.55); padding: 8px 12px; border-radius: 8px; white-space: pre; pointer-events: none; }
+  #bar { position: fixed; top: 12px; right: 12px; display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; max-width: 60vw; }
+  #bar button { background: rgba(30,30,30,.85); color: #eee; border: 1px solid #555; border-radius: 6px;
+                padding: 6px 10px; font-size: 12px; cursor: pointer; }
+  #bar button.on { background: #2a6fdb; border-color: #5b9cff; }
+  #pip { position: fixed; left: 12px; bottom: 12px; width: 240px; border-radius: 8px; border: 2px solid #333; display: none; }
+  #help { position: fixed; right: 12px; bottom: 12px; color: #888; font-size: 11px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">connecting...</div>
+<div id="bar">
+  <button id="bFit">Fit view</button>
+  <button id="bFollow">Follow phone</button>
+  <button id="bMode">Shading: gray</button>
+  <button id="bWire">Wireframe</button>
+  <button id="bBg">Background</button>
+  <button id="bTraj" class="on">Trajectory</button>
+</div>
+<img id="pip" alt="latest keyframe">
+<div id="help">drag: rotate · right-drag: pan · wheel: zoom</div>
+
+<script src="vendor/three.min.js"></script>
+<script src="vendor/OrbitControls.js"></script>
+<script src="vendor/PLYLoader.js"></script>
+<script>
+const canvas = document.getElementById('c');
+const hud = document.getElementById('hud');
+const pip = document.getElementById('pip');
+
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.outputEncoding = THREE.sRGBEncoding;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+
+// Z is up in NeuralRecon's world frame.
+const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 500);
+camera.up.set(0, 0, 1);
+camera.position.set(3, -3, 2.5);
+scene.add(camera);
+
+const controls = new THREE.OrbitControls(camera, canvas);
+controls.enableDamping = true;
+controls.dampingFactor = 0.1;
+
+// Lighting: dim sky/ground fill plus an off-axis key light that follows the viewer, so surfaces keep visible shading.
+scene.add(new THREE.HemisphereLight(0xffffff, 0x2a2a33, 0.4));
+const headlight = new THREE.DirectionalLight(0xffffff, 0.8);
+headlight.position.set(-0.7, 0.9, 0.6);
+camera.add(headlight);
+camera.add(headlight.target);
+
+const MATERIALS = {
+  gray: new THREE.MeshStandardMaterial({ color: 0xc8c8c8, roughness: 0.9, metalness: 0.0, side: THREE.DoubleSide }),
+  height: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0.0, side: THREE.DoubleSide }),
+  normal: new THREE.MeshNormalMaterial({ side: THREE.DoubleSide }),
+};
+const MODE_ORDER = ['gray', 'height', 'normal'];
+let mode = 'gray', wire = false, follow = false, showTraj = true;
+let mesh = null;
+let fittedOnce = false;
+
+const trajLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x2de2e6 }));
+trajLine.frustumCulled = false;
+scene.add(trajLine);
+const frustum = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xffd23f }));
+frustum.frustumCulled = false;
+scene.add(frustum);
+let phonePos = null;
+
+function turbo(t) {
+  // compact blue -> cyan -> green -> yellow -> red ramp
+  const stops = [[0.18,0.25,0.85],[0.1,0.75,0.9],[0.3,0.85,0.35],[0.95,0.85,0.2],[0.9,0.25,0.15]];
+  const x = Math.min(0.9999, Math.max(0, t)) * (stops.length - 1);
+  const i = Math.floor(x), f = x - i;
+  return stops[i].map((v, k) => v + (stops[i + 1][k] - v) * f);
+}
+
+function applyMeshStyle() {
+  if (!mesh) return;
+  mesh.material = MATERIALS[mode];
+  mesh.material.wireframe = wire;
+}
+
+function setMeshFromBuffer(buf) {
+  const g = new THREE.PLYLoader().parse(buf);
+  g.computeVertexNormals();
+  const pos = g.attributes.position;
+  let zmin = Infinity, zmax = -Infinity;
+  for (let i = 0; i < pos.count; i++) { const z = pos.getZ(i); if (z < zmin) zmin = z; if (z > zmax) zmax = z; }
+  const col = new Float32Array(pos.count * 3);
+  for (let i = 0; i < pos.count; i++) {
+    const c = turbo((pos.getZ(i) - zmin) / Math.max(1e-6, zmax - zmin));
+    col[3 * i] = c[0]; col[3 * i + 1] = c[1]; col[3 * i + 2] = c[2];
+  }
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  if (mesh) { mesh.geometry.dispose(); mesh.geometry = g; }
+  else { mesh = new THREE.Mesh(g, MATERIALS[mode]); scene.add(mesh); }
+  applyMeshStyle();
+  if (!fittedOnce && pos.count > 0) { fitView(); fittedOnce = true; }
+}
+
+function fitView() {
+  const box = new THREE.Box3();
+  if (mesh) { mesh.geometry.computeBoundingBox(); box.copy(mesh.geometry.boundingBox); }
+  if (box.isEmpty() && trajLine.geometry.boundingBox) box.copy(trajLine.geometry.boundingBox);
+  if (box.isEmpty()) return;
+  const c = box.getCenter(new THREE.Vector3());
+  const s = box.getSize(new THREE.Vector3()).length();
+  controls.target.copy(c);
+  camera.position.set(c.x + s * 0.55, c.y - s * 0.75, c.z + s * 0.55);
+  camera.near = Math.max(0.01, s / 500); camera.far = s * 20; camera.updateProjectionMatrix();
+}
+
+function setTrajectory(points) {
+  const arr = new Float32Array(points.flat());
+  trajLine.geometry.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+  trajLine.geometry.computeBoundingBox();
+  trajLine.visible = showTraj && points.length > 1;
+}
+
+function setFrustum(p) {
+  if (!p || p.length !== 5) { frustum.visible = false; phonePos = null; return; }
+  const o = p[0], c = p.slice(1);
+  const segs = [];
+  for (let i = 0; i < 4; i++) { segs.push(...o, ...c[i]); segs.push(...c[i], ...c[(i + 1) % 4]); }
+  frustum.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(segs), 3));
+  frustum.visible = true;
+  phonePos = new THREE.Vector3(...o);
+}
+
+let lastVer = -1, lastFrames = -1;
+async function poll() {
+  try {
+    const s = await (await fetch('state.json', { cache: 'no-store' })).json();
+    hud.textContent = s.hud || '';
+    setTrajectory(s.trajectory || []);
+    setFrustum(s.frustum);
+    if (s.mesh_version > 0 && s.mesh_version !== lastVer) {
+      const buf = await (await fetch('mesh.ply?v=' + s.mesh_version, { cache: 'no-store' })).arrayBuffer();
+      setMeshFromBuffer(buf);
+      lastVer = s.mesh_version;
+    }
+    if (s.frames > 0 && s.frames !== lastFrames) { pip.src = 'latest.jpg?t=' + s.frames; pip.style.display = 'block'; lastFrames = s.frames; }
+  } catch (e) {
+    hud.textContent = 'viewer server offline';
+  }
+  setTimeout(poll, 250);
+}
+
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize); resize();
+
+function toggle(id, on) { document.getElementById(id).classList.toggle('on', on); }
+document.getElementById('bFit').onclick = fitView;
+document.getElementById('bFollow').onclick = () => { follow = !follow; toggle('bFollow', follow); };
+document.getElementById('bMode').onclick = (e) => {
+  mode = MODE_ORDER[(MODE_ORDER.indexOf(mode) + 1) % MODE_ORDER.length];
+  e.target.textContent = 'Shading: ' + mode; applyMeshStyle();
+};
+document.getElementById('bWire').onclick = () => { wire = !wire; toggle('bWire', wire); applyMeshStyle(); };
+document.getElementById('bBg').onclick = () => {
+  const dark = scene.background.getHex() === 0x000000;
+  scene.background = new THREE.Color(dark ? 0xffffff : 0x000000);
+};
+document.getElementById('bTraj').onclick = () => {
+  showTraj = !showTraj; toggle('bTraj', showTraj); trajLine.visible = showTraj; frustum.visible = showTraj && !!phonePos;
+};
+
+function animate() {
+  requestAnimationFrame(animate);
+  if (follow && phonePos) controls.target.lerp(phonePos, 0.08);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+poll();
+</script>
+</body>
+</html>
