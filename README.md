@@ -1,3 +1,52 @@
+# NeuralRecon-Android
+
+A fork of [zju3dv/NeuralRecon](https://github.com/zju3dv/NeuralRecon) that replaces the iPhone capture step with an
+Android phone (ARCore) and adds a live preview. The phone and the PC side live in this one repository.
+
+- `android/`: the **ArRecorder** app (Kotlin, ARCore). It records camera frames with ARCore poses and intrinsics, saves them on
+  the phone, and streams them to the PC over USB while you record.
+- `live_demo.py`: the PC side of the live preview. It receives the stream, runs NeuralRecon incrementally on the GPU and serves a
+  browser viewer at http://127.0.0.1:8000/.
+- `viewer/` and `tools/live_viewer.py`: the three.js viewer (lit grey mesh, camera trajectory, phone frustum, latest keyframe).
+- `tools/process_arcore_data.py`: converts a saved phone recording into the layout `demo.py` expects.
+- `tools/view_mesh.py`: opens any saved `.ply` mesh in the same viewer.
+- `tools/replay_capture.py`: streams a saved recording to `live_demo.py` as if it were the phone, for testing.
+- `VERSION_NOTES.md`: the library versions this fork was run with and why they differ from the original `environment.yaml`.
+
+## Quick start
+
+1. **PC environment.** Follow `VERSION_NOTES.md` (PyTorch 1.13.1 + CUDA 11.7 and `torchsparse` 1.4.0 were used) and download the
+   pretrained weights as described in the original README below into `checkpoints/`.
+2. **Phone app.** Needs Android Studio's SDK (or just the command-line SDK) and a phone with ARCore, USB debugging on.
+   ```bash
+   cd android
+   echo "sdk.dir=$HOME/Android/Sdk" > local.properties
+   ./gradlew assembleDebug
+   adb install -r app/build/outputs/apk/debug/app-debug.apk
+   ```
+3. **Live preview.** Plug the phone in over USB, then on the PC:
+   ```bash
+   python live_demo.py --cfg ./config/demo.yaml
+   ```
+   This runs `adb reverse`, starts the viewer and opens the browser. In the app, wait for `tracking=TRACKING`, tap
+   START RECORDING and walk slowly around the room. Each recording is saved to `results/live/<session>/` on the PC
+   (frames, `poses.csv`, `mesh.ply`, `mesh_raw.ply`) and on the phone under
+   `/sdcard/Android/data/com.lhan.arrec/files/`.
+4. **Offline instead of live.** Pull a recording and run the original pipeline:
+   ```bash
+   adb pull /sdcard/Android/data/com.lhan.arrec/files/<rec_name> captures/
+   python -m tools.process_arcore_data --rec_dir captures/<rec_name>
+   python demo.py --cfg ./config/demo.yaml TEST.PATH captures/<rec_name>_neucon
+   python -m tools.view_mesh results/scene_demo_checkpoints_fusion_eval_47/<rec_name>_neucon.ply
+   ```
+
+The viewer only cleans and smooths the mesh for display (`--min-faces`, `--smooth`); the raw network output is what is saved
+as `mesh_raw.ply`.
+
+The original NeuralRecon README follows unchanged. Code from the original project is under its Apache-2.0 license (see `LICENSE`).
+
+---
+
 # NeuralRecon: Real-Time Coherent 3D Reconstruction from Monocular Video
 ### [Project Page](https://zju3dv.github.io/neuralrecon) | [Paper](https://arxiv.org/pdf/2104.00681.pdf)
 <br/>

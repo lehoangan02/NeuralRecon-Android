@@ -146,3 +146,12 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# NeuralRecon-Android: local-only files
+android/.gradle/
+android/.kotlin/
+android/local.properties
+android/app/build/
+*.apk
+captures/
+data/
